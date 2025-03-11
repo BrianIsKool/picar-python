@@ -5,233 +5,141 @@ from picar import front_wheels, back_wheels, Servo
 import math 
 from asyncio_mqtt import Client, MqttError
 import time
-import random
-import os
+import random 
+import logging
 
+# ======================================== CONFIG ===========================================
 
-# Sorry for the shit code, if something is not clear, write to me in telegram - @BrianIsKool
-
-
-# =============================GLOBAL===============================
 DEBUG = True
-picar.setup()
-
-fw = front_wheels.Front_Wheels()
-bw = back_wheels.Back_Wheels()
-sensorServo = Servo.Servo(1)
-LidarFrequency = 0.0011
 
 LIDAR_I2C_ADDR = 0x62 # adress I2C lidar 
 ACQ_COMMAND = 0x00 # reg lidar 
 DISTANCE_REG_HI = 0x0f
 DISTANCE_REG_LO = 0x10
+LIDAR_FREQUENCY = 0.0011
+CRIRICAL_DISTANCE = 50
 
-bus = smbus2.SMBus(1)
-time.sleep(1)
-# ==================================================================
+logging.basicConfig(level=logging.INFO, format="%(levelname)s - %(message)s")
+picar.setup()
 
-async def mqtt(queue): # das ist mqtt debug. 
-    async with Client("test.mosquitto.org") as client:
-        async with client.messages() as messages:
-            await client.subscribe("BrianIsKool/test")
-            async for message in messages:
-                await queue.put(dict(who="mqtt", cmd=message.payload.decode("utf-8"))) 
-                # print(message.payload.decode("utf-8"))
+# ======================================== Classes ==========================================
 
+class Lidar:
+    def __init__(self, bus, freq):
+        self.bus = bus
+        self.frequency = freq
 
+    async def get_distance(self):
+        self.bus.write_byte_data(LIDAR_I2C_ADDR, ACQ_COMMAND, 0x04)
+        await asyncio.sleep(self.frequency)
 
-
-async def lidar(queueLidar, frequency): # hier ich bekomme daten von Lidar sensor
-    while True:
-        bus.write_byte_data(LIDAR_I2C_ADDR, ACQ_COMMAND, 0x04)
-        await asyncio.sleep(frequency)
-        dist_hi = bus.read_byte_data(LIDAR_I2C_ADDR, DISTANCE_REG_HI)
-        dist_lo = bus.read_byte_data(LIDAR_I2C_ADDR, DISTANCE_REG_LO)
-
+        dist_hi = self.bus.read_byte_data(LIDAR_I2C_ADDR, DISTANCE_REG_HI)
+        dist_lo = self.bus.read_byte_data(LIDAR_I2C_ADDR, DISTANCE_REG_LO)
         distance = (dist_hi << 8) + dist_lo
-        await queueLidar.put(dict(who="lidar", distance = distance))
+        return distance
+    
+class MotorController:
+    def __init__(self):
+        self.fw = front_wheels.Front_Wheels()
+        self.bw = back_wheels.Back_Wheels()
+        self.sensorServo = Servo.Servo(1)
+
+    async def stop(self):
+        self.bw.stop()
+        
+    async def move(self, speed):
+        self.bw.speed = abs(speed)
+        if speed >= 0 and speed <= 100:
+            self.bw.backward()
+        elif speed < 0 and speed >= -100:
+            self.bw.forward()
+
+    async def fwheels_servo(self, direction):
+        directions = {"left": self.fw.turn_left,
+                      "mid": self.fw.turn_straight, 
+                      "right": self.turn_right}
+        
+        if direction in directions: 
+            directions[direction]()
+            logging.info(f"Steering Angle: {direction}")
+
+    async def servoLidar(self, arg):
+        self.sensorServo.write(arg)
+
+class MQTT:
+    def __init__(self, queue):
+        self.queue = queue
+
+    async def listen(self):
+        async with Client("test.mosquitto.org") as client:
+            async with client.messages() as messages:
+                await client.subscribe("BrianIsKool/test")
+                async for message in messages:
+                    await self.queue.put(dict(who="mqtt", cmd=message.payload.decode("utf-8")))
+
+    async def publish(self, queue_data):
+        async with Client("test.mosquitto.org") as client:
+            while True:
+                data = await queue_data.get()
+                if data:
+                    await client.publish("/BrianIsKool/stat", str(data))
+                    logging.info(f"Published Data: {data}")
+                await asyncio.sleep(0.1)
     
 
-async def motors(queue):
-    # queue = dict {who: wheels, ServoWheels, ServoLidar, speed: for wheels '''arg: left, mid, right''' , for servo grad 0-180}
-    while True:
-        item = await queue.get()
-        # =================================
-        async def wheels(speed):
-            bw.speed = abs(speed)  
-            if speed >= 0:
-                bw.backward()
-            elif speed < 0:
-                bw.forward()
+# ========================================= Logic =================================================
+class Robot:
+    def __init__(self):
+        self.queue = asyncio.Queue()
+        self.lidar = Lidar(smbus2.SMBus(1), LIDAR_FREQUENCY)
+        self.motors = MotorController()
+        self.mqtt = MQTT(self.queue)
 
-        async def wheelServ(arg):
-            '''arg: left, mid, right'''
-            if arg == "left":
-                fw.turn_left()
-                if DEBUG:
-                    print("Steering Angle: Left")
-            if arg == "mid":
-                fw.turn_straight()
-                if DEBUG:
-                    print("Steering Angle: Middle")
-            if arg == "right":
-                fw.turn_right()
-                if DEBUG:
-                    print("Steering Angle: Right")
-
-        async def servoLidar(arg):
-            sensorServo.write(arg) 
-
-        async def stopMotors(): 
-            bw.stop()
-        # =================================
-
-        if item["who"] == "wheels":
-            # print("motor is here!", item["speed"])
-            await wheels(item["speed"])
-            if item["speed"] == 0 or item["speed"] == "0":
-                await stopMotors()
-                
-        elif item["who"] == "servoWheels":
-            await wheelServ(item["speed"])
-
-        elif item["who"] == "ServoLidar": 
-            await servoLidar(item["speed"])
-
-
-
-async def lidarData(queueLidar, queueMotor, queueLidarData):
-    offset = 0
-    counter = 0
-    dur = 0
-    data = {}
-    direction = 1  
-    while True:
-        item = await queueLidar.get()
-
-        if item["who"] == "lidar":
-            distance = item["distance"]
-            if counter < 3:  
-                dur += distance
-                counter += 1
-            else:
-                data[offset] = dur / 3 
-                dur = 0
-                counter = 0
-                
-
-                offset += 5 * direction
-                
-                if offset >= 180:
-                    direction = -1
-                    offset = 180
-                elif offset <= 0:
-                    direction = 1
-                    offset = 0
-                
-                await queueMotor.put(dict(who="ServoLidar", speed=offset))
-                await queueLidarData.put(data) 
-
-        elif item["who"] == "mqtt":
-            if item["cmd"] == "0":
-                await queueMotor.put(dict(who="wheels", speed=0))
-                await asyncio.sleep(0)
-                print("PANIC STOP!!!!")
-                os._exit(1)
-   
-
-            if item["cmd"] == "1":
-                await queueMotor.put(dict(who="servoWheels", speed="left"))
-                print("to left")
-                
-            elif item["cmd"] == "2":
-                await queueMotor.put(dict(who="servoWheels", speed="right"))
-                print("to richt")
-                
-            elif item["cmd"] == "3":
-                await queueMotor.put(dict(who="servoWheels", speed="mid"))
-                print("mid")
-
-
-# ====================================JUST FOR FUN======================================
-
-
-
-async def mqtt_publish(queueLidarData):
-    async with Client("test.mosquitto.org") as client:
+    async def lidar_task(self):
         while True:
-            # Получаем данные лидара
-            data = await queueLidarData.get()
-            if data:
-                # Отправляем данные на канал "robot/statistics"                                          
-                await client.publish("/BrianIsKool/stat", str(data))
-                print(f"Отправка данных: {data}")
-            await asyncio.sleep(0.1)  # Задержка между отправками
+            distance = await self.lidar.get_distance()
+            await self.queue.put(dict(who="lidar", distance=distance))
 
+    async def process_commands(self):
+        while True:
+            item = await self.queue.get()
+            if item["who"] == "lidar":
+                await self.handle_lidar_data(item["distance"])
+            elif item["who"] == "mqtt":
+                await self.handle_mqtt_command(item["cmd"])
 
-# ======================================================================================
-
-
-
-async def main(queueMotor, queueLidarData, queueControl):
-    while True: 
-        data = await queueLidarData.get()
-        print(f"processed data from Lidar: {data}")
-
-
-        min_distance = min(data.values())
-        closest_angle = [angle for angle, dist in data.items() if dist == min_distance][0]
-
-
-        critical_distance = 50
-
-        if all(dist < critical_distance for dist in data.values()):
-            print("A hopeless situation: we give it back!")
-            # Сдаём назад
-            await queueMotor.put(dict(who="wheels", speed=-30))  
-            await asyncio.create_task(asyncio.sleep(1))  
-            await queueMotor.put(dict(who="wheels", speed=0)) 
-
-            print("Turn to find exit")
-            await queueMotor.put(dict(who="servoWheels", speed="right"))
-            await asyncio.create_task(asyncio.sleep(1))
-            await queueMotor.put(dict(who="servoWheels", speed="mid")) 
-            continue  
-
-
-        if min_distance < critical_distance:
-            if closest_angle < 90:
-                print("Obstacle on the right, turn left")
-                await queueMotor.put(dict(who="servoWheels", speed="left"))
-            else:
-                print("Obstacle on the left, turn right")
-                await queueMotor.put(dict(who="servoWheels", speed="right"))
-            await queueMotor.put(dict(who="wheels", speed=30)) 
+    async def handle_lidar_data(self, distance):
+        if distance < CRIRICAL_DISTANCE:
+            await self.queue.put(dict(who="motor", speed=-30))
+            await asyncio.sleep(1)
+            await self.queue.put(dict(who="motor", speed=0))
+            await self.queue.put(dict(who="servo", direction="right"))
+            await asyncio.sleep(1)
+            await self.queue.put(dict(who="servo", direction="mid"))
         else:
-            print("The path is clear, moving forward")
-            await queueMotor.put(dict(who="servoWheels", speed="mid"))
-            await queueMotor.put(dict(who="wheels", speed=60))
+            await self.queue.put(dict(who="motor", speed=60))
+            await self.queue.put(dict(who="servo", direction="mid"))
+
+    async def handle_mqtt_command(self, cmd):
+        commands = {
+            "0": lambda: self.queue.put_nowait(dict(who="motor", speed=0)),
+            "1": lambda: self.queue.put_nowait(dict(who="servo", direction="left")),
+            "2": lambda: self.queue.put_nowait(dict(who="servo", direction="right")),
+            "3": lambda: self.queue.put_nowait(dict(who="servo", direction="mid"))
+        }
+        if cmd in commands:
+            await commands[cmd]()
+
+    async def run(self):
+        tasks = [
+            asyncio.create_task(self.lidar_task()),
+            asyncio.create_task(self.process_commands()),
+            asyncio.create_task(self.mqtt.listen()),
+            asyncio.create_task(self.mqtt.publish(self.queue))
+        ]
+        await asyncio.gather(*tasks)
 
 
-async def run():
-    queueMotor = asyncio.Queue()
-    queueLidar = asyncio.Queue()
-    queueControl = asyncio.Queue()
-    queueLidarData = asyncio.Queue()
-
-    
-    lidarTask = asyncio.create_task(lidar(queueLidar=queueLidar, frequency=LidarFrequency))
-    motorsTask = asyncio.create_task(motors(queueMotor))
-    mqttTask = asyncio.create_task(mqtt(queueLidar))
-    lidarDataTask = asyncio.create_task(lidarData(queueLidarData=queueLidarData, queueMotor=queueMotor, queueLidar=queueLidar))
-    mainTask = asyncio.create_task(main(queueMotor=queueMotor, queueLidarData=queueLidarData, queueControl=queueControl))
-
-    mqtt_publishTask = asyncio.create_task(mqtt_publish(queueLidarData=queueLidarData))
-
-    
-    await asyncio.gather(mainTask, lidarTask, motorsTask, mqttTask, lidarDataTask, mqtt_publishTask)
-
-
-asyncio.run(run())
-
-# coded by BrianIsKool 
+if __name__ == "__main__":
+    robot = Robot()
+    asyncio.run(robot.run())
