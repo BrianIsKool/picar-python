@@ -102,6 +102,7 @@ class Robot:
 
     async def process_commands(self):
         while True:
+            logging.info(f"Queue size: {self.queue.qsize()}")
             item = await self.queue.get()
             if item["who"] == "lidar":
                 await self.handle_lidar_data(item["distance"])
